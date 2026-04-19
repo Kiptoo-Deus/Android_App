@@ -1,0 +1,21 @@
+# Gradle
+.gradle/
+caches/
+
+# Build outputs
+build/
+*/build/
+
+# Local config
+local.properties
+
+# IDE
+.idea/
+*.iml
+
+# OS
+.DS_Store
+
+# Native
+.externalNativeBuild/
+.cxx/

@@ -1,0 +1,5 @@
+{
+  [key: string]: { children?: WikiTreeNode; name: string };
+}
+
+export const wikiTree: WikiTreeNode = wikiTreeJson
