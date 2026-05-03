@@ -3,6 +3,8 @@ package com.luciano.chordseq
 import android.app.AlertDialog
 import android.graphics.*
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.util.TypedValue
 import android.view.*
@@ -12,6 +14,7 @@ import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -55,12 +58,70 @@ private object C {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Data model — mutable note grid
+//  Each chord slot holds a mutable list of MIDI notes the user can edit.
+//  We keep this separate from ChordEngine.Prediction so edits don't need
+//  a full re-prediction.
+// ─────────────────────────────────────────────────────────────────────────────
+data class EditableChord(
+    var name      : String,           // display name, re-analysed on edit
+    val midiNotes : MutableList<Int>  // live note list
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Chord analyser — derives a chord name from a set of MIDI notes.
+//  Uses a simple interval-pattern lookup. Returns "?" for unknown combos.
+// ─────────────────────────────────────────────────────────────────────────────
+object ChordAnalyser {
+
+    private val NOTE_NAMES = listOf("C","C#","D","D#","E","F","F#","G","G#","A","A#","B")
+
+    // Interval patterns → chord suffix
+    private val PATTERNS = listOf(
+        setOf(0,4,7)     to "",
+        setOf(0,3,7)     to "m",
+        setOf(0,4,7,11)  to "maj7",
+        setOf(0,4,7,10)  to "7",
+        setOf(0,3,7,10)  to "m7",
+        setOf(0,3,6)     to "dim",
+        setOf(0,4,8)     to "aug",
+        setOf(0,5,7)     to "sus4",
+        setOf(0,2,7)     to "sus2",
+        setOf(0,4,7,9)   to "6",
+        setOf(0,3,7,9)   to "m6",
+        setOf(0,4,7,10,14) to "9",
+        setOf(0,3,7,10,14) to "m9",
+        setOf(0,4,7,10,13) to "7b9",
+        setOf(0,3,6,10)  to "m7b5",
+        setOf(0,4,6,10)  to "7b5",
+        setOf(0,4,7,10,17) to "11",
+        setOf(0,3,7,10,17) to "m11"
+    )
+
+    fun analyse(midiNotes: List<Int>): String {
+        if (midiNotes.isEmpty()) return "—"
+        if (midiNotes.size == 1) return NOTE_NAMES[midiNotes[0] % 12]
+
+        // Try every note as potential root
+        val pcs = midiNotes.map { it % 12 }.toSet()
+        for (root in pcs) {
+            val intervals = pcs.map { ((it - root + 12) % 12) }.toSet()
+            val match = PATTERNS.firstOrNull { it.first == intervals }
+            if (match != null) return NOTE_NAMES[root] + match.second
+        }
+        // Partial match — just name root + note count
+        val root = midiNotes.minOrNull()!! % 12
+        return NOTE_NAMES[root] + "(custom)"
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  MainActivity
 // ─────────────────────────────────────────────────────────────────────────────
 class MainActivity : AppCompatActivity() {
 
     private lateinit var chordEngine : ChordEngine
-    private val progression          = mutableListOf<ChordEngine.Prediction>()
+    private val editableChords       = mutableListOf<EditableChord>()   // live editable grid
     private val tokenHistory         = mutableListOf<Long>()
     private val inferenceTimes       = mutableListOf<Long>()
 
@@ -72,11 +133,11 @@ class MainActivity : AppCompatActivity() {
     private var chordsByRoot   = mapOf<String, List<String>>()
     private var selectedChordName: String? = null
 
-    // Playback state
-    private var isPlaying      = false
-    private var playJob        : Job? = null
-    private var bpm            = 120
-    private var snapValue      = "1/16"
+    // Playback
+    private var isPlaying = false
+    private var playJob   : Job? = null
+    private var bpm       = 120
+    private var snapValue = "1/16"
 
     // UI refs
     private lateinit var metaText      : TextView
@@ -130,46 +191,35 @@ class MainActivity : AppCompatActivity() {
     private fun buildUI() {
         val scroll = ScrollView(this).apply { setBackgroundColor(C.BG_WRAP) }
         val screen = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(C.BG_SCREEN)
+            orientation = LinearLayout.VERTICAL; setBackgroundColor(C.BG_SCREEN)
         }
-        screen.addView(buildTopBar())
-        screen.addView(hDivider())
-        screen.addView(buildStyleSection())
-        screen.addView(hDivider())
-        screen.addView(buildPianoSection())
-        screen.addView(hDivider())
-        screen.addView(buildProgressionSection())
-        screen.addView(hDivider())
+        screen.addView(buildTopBar()); screen.addView(hDivider())
+        screen.addView(buildStyleSection()); screen.addView(hDivider())
+        screen.addView(buildPianoSection()); screen.addView(hDivider())
+        screen.addView(buildProgressionSection()); screen.addView(hDivider())
         screen.addView(buildRollHeader())
-        screen.addView(buildRollBody())
-        screen.addView(hDivider())
-        screen.addView(buildVelocitySection())
-        screen.addView(hDivider())
+        screen.addView(buildRollBody()); screen.addView(hDivider())
+        screen.addView(buildVelocitySection()); screen.addView(hDivider())
         screen.addView(buildBottomBar())
-        scroll.addView(screen)
-        setContentView(scroll)
+        scroll.addView(screen); setContentView(scroll)
     }
 
     private fun buildTopBar(): View {
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(16), dp(14), dp(16), dp(10))
-            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(14), dp(16), dp(10)); gravity = Gravity.CENTER_VERTICAL
         }
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         col.addView(TextView(this).apply {
-            text = "ChordAnds"           // ← renamed
-            textSize = 16f; setTypeface(null, Typeface.BOLD); setTextColor(C.TXT_PRIMARY)
+            text = "ChordAnds"; textSize = 16f
+            setTypeface(null, Typeface.BOLD); setTextColor(C.TXT_PRIMARY)
         })
         metaText = TextView(this).apply {
-            text = "Select genre, decade & first chord"
-            textSize = 10f; setTextColor(C.TXT_MUTED)
+            text = "Select genre, decade & first chord"; textSize = 10f; setTextColor(C.TXT_MUTED)
         }
         statusBadge = TextView(this).apply { text = "Starting…"; textSize = 9f; setTextColor(C.TXT_HINT) }
         col.addView(metaText); col.addView(statusBadge)
         bar.addView(col, lp(0, WRAP) { weight = 1f })
-
         val dots = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         C.SLOTS.forEach { cols ->
             dots.addView(View(this).apply {
@@ -177,8 +227,7 @@ class MainActivity : AppCompatActivity() {
                 layoutParams = LinearLayout.LayoutParams(dp(7), dp(7)).apply { marginStart = dp(5) }
             })
         }
-        bar.addView(dots)
-        return bar
+        bar.addView(dots); return bar
     }
 
     private fun buildStyleSection(): View {
@@ -226,10 +275,8 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.HORIZONTAL
             setPadding(dp(16), dp(8), dp(16), dp(4)); gravity = Gravity.CENTER_VERTICAL
         }
-        rollTitleText = TextView(this).apply { text = "piano roll"; textSize = 10f; setTextColor(C.TXT_HINT) }
+        rollTitleText = TextView(this).apply { text = "piano roll · tap=add  drag=move  hold=delete"; textSize = 9f; setTextColor(C.TXT_HINT) }
         row.addView(rollTitleText, lp(0, WRAP) { weight = 1f })
-
-        // Snap badge — tappable
         snapBadge = smallBadge(snapValue, active = true)
         snapBadge.setOnClickListener { showSnapPicker() }
         row.addView(snapBadge)
@@ -239,9 +286,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun buildRollBody(): View {
-        pianoRollView = PianoRollView(this)
+        pianoRollView = PianoRollView(this,
+            onNoteAdded   = { chordIdx, midi -> onNoteAdded(chordIdx, midi) },
+            onNoteRemoved = { chordIdx, midi -> onNoteRemoved(chordIdx, midi) },
+            onNoteMoved   = { fromChord, toChord, midi -> onNoteMoved(fromChord, toChord, midi) }
+        )
         return pianoRollView.also {
-            it.layoutParams = LinearLayout.LayoutParams(MATCH, dp(190)).apply {
+            it.layoutParams = LinearLayout.LayoutParams(MATCH, dp(220)).apply {
                 setMargins(dp(14), 0, dp(14), dp(8))
             }
         }
@@ -259,8 +310,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun buildBottomBar(): View {
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-
-        // Row 1: play | bpm | generate
         val row1 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(dp(14), dp(10), dp(14), dp(6)); gravity = Gravity.CENTER_VERTICAL
@@ -268,7 +317,6 @@ class MainActivity : AppCompatActivity() {
         playBtn  = iconBtn("▶") { togglePlay() }
         bpmLabel = TextView(this).apply {
             text = "$bpm bpm"; textSize = 11f; setTextColor(C.TXT_MUTED)
-            // Tap to change BPM
             setOnClickListener { showBpmPicker() }
         }
         generateBtn = pillBtn("Generate ↗", primary = true) { onGenerateClicked() }
@@ -279,7 +327,6 @@ class MainActivity : AppCompatActivity() {
         row1.addView(generateBtn)
         col.addView(row1)
 
-        // Row 2: predict | reset
         val row2 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(dp(14), 0, dp(14), dp(14)); gravity = Gravity.CENTER_VERTICAL
@@ -289,8 +336,7 @@ class MainActivity : AppCompatActivity() {
         val resetBtn = iconBtn("↺") { onResetClicked() }
         row2.addView(predictBtn, lp(0, WRAP) { weight = 1f; marginEnd = dp(8) })
         row2.addView(resetBtn)
-        col.addView(row2)
-        return col
+        col.addView(row2); return col
     }
 
     // ── Timeline ──────────────────────────────────────────────────────────────
@@ -298,32 +344,33 @@ class MainActivity : AppCompatActivity() {
     private fun rebuildTimeline() {
         timeline.removeAllViews()
         for (i in 0..3) {
+            val chord = editableChords.getOrNull(i)
             val view = when {
-                progression.getOrNull(i) != null -> filledSlot(i, progression[i])
-                i == progression.size             -> predictSlot()
-                else                              -> emptySlot(i)
+                chord != null             -> filledSlot(i, chord)
+                i == editableChords.size  -> predictSlot()
+                else                      -> emptySlot(i)
             }
             timeline.addView(view, lp(0, MATCH) { weight = 1f })
         }
     }
 
-    private fun filledSlot(i: Int, pred: ChordEngine.Prediction): View {
+    private fun filledSlot(i: Int, chord: EditableChord): View {
         val cols = C.SLOTS[i % C.SLOTS.size]
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(8), dp(7), dp(8), 0); setBackgroundColor(cols[0])
             addView(TextView(this@MainActivity).apply {
-                text = pred.chordName; textSize = 13f
+                text = chord.name; textSize = 13f
                 setTypeface(null, Typeface.BOLD); setTextColor(cols[1])
             })
             addView(TextView(this@MainActivity).apply {
-                text = "${romanNumeral(i)} · maj"; textSize = 9f; setTextColor(cols[2])
+                text = "${romanNumeral(i)} · ${if (chord.midiNotes.isEmpty()) "empty" else "custom"}"; textSize = 9f; setTextColor(cols[2])
             })
             addView(View(this@MainActivity).apply {
                 setBackgroundColor(cols[3])
                 layoutParams = LinearLayout.LayoutParams(MATCH, dp(3)).apply { topMargin = dp(5) }
             })
-            setOnClickListener { PianoSynth.playChord(pred.midiNotes) }
+            setOnClickListener { PianoSynth.playChord(chord.midiNotes) }
         }
     }
 
@@ -358,91 +405,163 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ── Widgets ───────────────────────────────────────────────────────────────
+    // ── Note edit callbacks from PianoRollView ────────────────────────────────
 
-    private fun secLabel(txt: String) = TextView(this).apply {
-        text = txt; textSize = 10f; setTextColor(C.TXT_HINT)
-        setPadding(dp(14), dp(10), dp(14), dp(6))
-    }
-
-    private fun hDivider() = View(this).apply {
-        setBackgroundColor(C.BORDER)
-        layoutParams = LinearLayout.LayoutParams(MATCH, 1).apply { setMargins(dp(14), 0, dp(14), 0) }
-    }
-
-    private fun pickerCard(label: String, value: String) = TextView(this).apply {
-        text = "$label\n$value"; textSize = 12f; setTextColor(C.TXT_PRIMARY)
-        setPadding(dp(10), dp(10), dp(10), dp(10)); setBackgroundColor(C.BG_SECTION)
-    }
-
-    private fun smallBadge(label: String, active: Boolean = false) = TextView(this).apply {
-        text = label; textSize = 10f
-        setPadding(dp(7), dp(3), dp(7), dp(3))
-        setTextColor(if (active) C.PURPLE_LITE else C.TXT_MUTED)
-        setBackgroundColor(if (active) C.PURPLE_DARK else C.BG_CARD)
-    }
-
-    private fun iconBtn(label: String, action: () -> Unit) = TextView(this).apply {
-        text = label; textSize = 14f; gravity = Gravity.CENTER
-        setTextColor(C.TXT_MUTED); setBackgroundColor(C.BG_CARD)
-        setPadding(dp(10), dp(8), dp(10), dp(8))
-        minWidth = dp(40); minimumHeight = dp(36)
-        setOnClickListener { action() }
-    }
-
-    private fun pillBtn(label: String, primary: Boolean, action: () -> Unit) = TextView(this).apply {
-        text = label; textSize = 12f; gravity = Gravity.CENTER
-        setTypeface(null, Typeface.BOLD); setTextColor(C.PURPLE_LITE)
-        setBackgroundColor(if (primary) C.PURPLE else C.PURPLE_DARK)
-        setPadding(dp(18), dp(9), dp(18), dp(9))
-        setOnClickListener { action() }
-    }
-
-    private fun romanNumeral(i: Int) = listOf("I","II","III","IV")[i.coerceIn(0, 3)]
-
-    private fun lp(w: Int, h: Int, block: LinearLayout.LayoutParams.() -> Unit = {}) =
-        LinearLayout.LayoutParams(w, h).apply(block)
-
-    private fun dp(v: Int) = TypedValue.applyDimension(
-        TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics
-    ).toInt()
-
-    // ── Dialogs ───────────────────────────────────────────────────────────────
-
-    private fun showPicker(which: String) {
-        val items: Array<String> = when (which) {
-            "Genre"  -> (listOf("None") + chordEngine.genreLabels).toTypedArray()
-            "Decade" -> (listOf("None") + ChordEngine.DECADE_LABELS).toTypedArray()
-            else     -> return
+    /** User tapped an empty cell → add a note */
+    private fun onNoteAdded(chordIdx: Int, midi: Int) {
+        val chord = editableChords.getOrNull(chordIdx) ?: return
+        if (!chord.midiNotes.contains(midi)) {
+            chord.midiNotes.add(midi)
+            chord.midiNotes.sort()
+            reanalyseChord(chordIdx)
+            PianoSynth.playChord(listOf(midi))
         }
-        AlertDialog.Builder(this).setTitle(which)
-            .setItems(items) { _, pos ->
-                val picked = items[pos]
-                when (which) {
-                    "Genre"  -> { selectedGenre  = pos - 1; genreBtn.text  = "Genre\n$picked" }
-                    "Decade" -> { selectedDecade = pos - 1; decadeBtn.text = "Decade\n$picked" }
+    }
+
+    /** User long-pressed a note → remove it */
+    private fun onNoteRemoved(chordIdx: Int, midi: Int) {
+        val chord = editableChords.getOrNull(chordIdx) ?: return
+        chord.midiNotes.remove(midi)
+        reanalyseChord(chordIdx)
+        if (chord.midiNotes.isNotEmpty()) PianoSynth.playChord(chord.midiNotes)
+    }
+
+    /** User dragged a note from one chord column to another (or within same chord to different pitch) */
+    private fun onNoteMoved(fromChordIdx: Int, toChordIdx: Int, midi: Int) {
+        val from = editableChords.getOrNull(fromChordIdx) ?: return
+        val to   = editableChords.getOrNull(toChordIdx)   ?: return
+        from.midiNotes.remove(midi)
+        if (!to.midiNotes.contains(midi)) to.midiNotes.add(midi)
+        to.midiNotes.sort()
+        reanalyseChord(fromChordIdx)
+        reanalyseChord(toChordIdx)
+        PianoSynth.playChord(to.midiNotes)
+    }
+
+    /** Re-derives chord name from current notes and refreshes the timeline slot */
+    private fun reanalyseChord(idx: Int) {
+        val chord = editableChords.getOrNull(idx) ?: return
+        chord.name = ChordAnalyser.analyse(chord.midiNotes)
+        pianoRollView.setEditableChords(editableChords)
+        rebuildTimeline()
+        chordHint.text = "Chord ${idx + 1} → ${chord.name}"
+    }
+
+    // ── Playback ──────────────────────────────────────────────────────────────
+
+    private fun playProgression() {
+        playJob?.cancel()
+        val chordDurationMs = (60_000L / bpm) * 4
+        playJob = lifecycleScope.launch {
+            setBtnEnabled(generateBtn, false); playBtn.text = "⏸"
+            val total = editableChords.size
+            for ((i, chord) in editableChords.withIndex()) {
+                if (!kotlinx.coroutines.currentCoroutineContext().isActive) break
+                highlightTimelineSlot(i)
+                pianoRollView.startPlayhead(i, total, chordDurationMs)
+                velocityView.animateForChord(i, chordDurationMs)
+                PianoSynth.playChord(chord.midiNotes, durationMs = chordDurationMs.toInt())
+                delay(chordDurationMs)
+            }
+            withContext(Dispatchers.Main) {
+                isPlaying = false; playBtn.text = "▶"
+                setBtnEnabled(generateBtn, editableChords.size >= 2)
+                pianoRollView.stopPlayhead(); velocityView.stopAnimation(); rebuildTimeline()
+            }
+        }
+    }
+
+    private fun highlightTimelineSlot(activeIdx: Int) {
+        for (i in 0 until timeline.childCount) {
+            timeline.getChildAt(i)?.alpha = if (i == activeIdx) 1f else 0.45f
+        }
+    }
+
+    // ── Actions ───────────────────────────────────────────────────────────────
+
+    private fun onPredictClicked() {
+        if (editableChords.size >= 4) return
+
+        if (editableChords.isEmpty()) {
+            val name = selectedChordName ?: run { chordHint.text = "Pick a starting note first"; return }
+            val tokenId = chordEngine.tokenForChord(name)
+                ?: chordsByRoot[selectedRoot]?.firstOrNull()?.let { chordEngine.tokenForChord(it) }
+                ?: run { chordHint.text = "'$name' not in model vocabulary"; return }
+            val notes = chordEngine.notesForChord(name).toMutableList()
+            tokenHistory.clear(); tokenHistory.add(ChordEngine.BOS_TOKEN)
+            tokenHistory.add(tokenId.toLong())
+            addEditableChord(EditableChord(name, notes))
+            PianoSynth.playChord(notes)
+            if (editableChords.size >= 4) return
+        }
+
+        setBtnEnabled(predictBtn, false); predictBtn.text = "Thinking…"
+        val genreW  = FloatArray(ChordEngine.N_GENRES).also  { w -> if (selectedGenre  in 0 until ChordEngine.N_GENRES)  w[selectedGenre]  = 1f }
+        val decadeW = FloatArray(ChordEngine.N_DECADES).also { w -> if (selectedDecade in 0 until ChordEngine.N_DECADES) w[selectedDecade] = 1f }
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            val pred = runCatching {
+                chordEngine.predictNextChord(
+                    inputIds      = tokenHistory,
+                    genreWeights  = genreW,
+                    decadeWeights = decadeW,
+                    temperature   = temperatures[tempIndex].first
+                )
+            }.onFailure { Log.e("ChordAnds", "Prediction failed", it) }.getOrNull()
+
+            withContext(Dispatchers.Main) {
+                if (pred != null) {
+                    inferenceTimes.add(pred.inferenceMs)
+                    addEditableChord(EditableChord(pred.chordName, pred.midiNotes.toMutableList()))
+                    PianoSynth.playChord(pred.midiNotes)
+                    rollTitleText.text = "piano roll · tap=add  drag=move  hold=delete"
                 }
-                updateMeta()
-            }.show()
+                predictBtn.text = "Predict next ↗"
+                setBtnEnabled(predictBtn, editableChords.size < 4)
+                setBtnEnabled(generateBtn, editableChords.size >= 2)
+            }
+        }
     }
 
-    private fun showBpmPicker() {
-        val options = arrayOf("60 bpm","80 bpm","90 bpm","100 bpm","110 bpm",
-            "120 bpm","130 bpm","140 bpm","160 bpm","180 bpm","200 bpm")
-        AlertDialog.Builder(this).setTitle("Tempo")
-            .setItems(options) { _, pos ->
-                bpm = options[pos].replace(" bpm","").toInt()
-                bpmLabel.text = "$bpm bpm"
-            }.show()
+    private fun onGenerateClicked() {
+        if (editableChords.isEmpty()) return
+        isPlaying = true; playProgression()
     }
 
-    private fun showSnapPicker() {
-        val options = arrayOf("1/4","1/8","1/16","1/32")
-        AlertDialog.Builder(this).setTitle("Snap Resolution")
-            .setItems(options) { _, pos ->
-                snapValue = options[pos]
-                snapBadge.text = snapValue
-            }.show()
+    private fun togglePlay() {
+        if (editableChords.isEmpty()) return
+        isPlaying = !isPlaying
+        if (isPlaying) {
+            playProgression()
+        } else {
+            playJob?.cancel(); playBtn.text = "▶"
+            setBtnEnabled(generateBtn, editableChords.size >= 2)
+            pianoRollView.stopPlayhead(); velocityView.stopAnimation(); rebuildTimeline()
+        }
+    }
+
+    private fun onResetClicked() {
+        playJob?.cancel(); isPlaying = false; playBtn.text = "▶"
+        tokenHistory.clear(); tokenHistory.add(ChordEngine.BOS_TOKEN)
+        editableChords.clear(); inferenceTimes.clear()
+        rebuildTimeline()
+        pianoRollView.setEditableChords(emptyList()); pianoRollView.stopPlayhead()
+        velocityView.stopAnimation()
+        rollTitleText.text = "piano roll · tap=add  drag=move  hold=delete"
+        chordHint.text     = "tap a key to set the first chord"
+        setBtnEnabled(predictBtn, true); setBtnEnabled(generateBtn, false)
+        updateMeta()
+    }
+
+    private fun addEditableChord(chord: EditableChord) {
+        if (editableChords.size >= 4) return
+        editableChords.add(chord)
+        pianoRollView.setEditableChords(editableChords)
+        rebuildTimeline()
+        val rem = 4 - editableChords.size
+        chordHint.text = "${chord.name} added · $rem slot${if (rem != 1) "s" else ""} remaining"
+        setBtnEnabled(predictBtn, editableChords.size < 4)
+        setBtnEnabled(generateBtn, editableChords.size >= 2)
     }
 
     // ── Engine ready ──────────────────────────────────────────────────────────
@@ -466,346 +585,407 @@ class MainActivity : AppCompatActivity() {
         metaText.text = "$r$g · $d"
     }
 
-    private fun setBtnEnabled(btn: TextView, on: Boolean) {
-        btn.isEnabled = on; btn.alpha = if (on) 1f else 0.38f
+    // ── Widgets ───────────────────────────────────────────────────────────────
+
+    private fun setBtnEnabled(btn: TextView, on: Boolean) { btn.isEnabled = on; btn.alpha = if (on) 1f else 0.38f }
+    private fun romanNumeral(i: Int) = listOf("I","II","III","IV")[i.coerceIn(0,3)]
+    private fun lp(w: Int, h: Int, block: LinearLayout.LayoutParams.() -> Unit = {}) = LinearLayout.LayoutParams(w, h).apply(block)
+    private fun dp(v: Int) = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics).toInt()
+
+    private fun secLabel(txt: String) = TextView(this).apply {
+        text = txt; textSize = 10f; setTextColor(C.TXT_HINT); setPadding(dp(14), dp(10), dp(14), dp(6))
+    }
+    private fun hDivider() = View(this).apply {
+        setBackgroundColor(C.BORDER)
+        layoutParams = LinearLayout.LayoutParams(MATCH, 1).apply { setMargins(dp(14), 0, dp(14), 0) }
+    }
+    private fun pickerCard(label: String, value: String) = TextView(this).apply {
+        text = "$label\n$value"; textSize = 12f; setTextColor(C.TXT_PRIMARY)
+        setPadding(dp(10), dp(10), dp(10), dp(10)); setBackgroundColor(C.BG_SECTION)
+    }
+    private fun smallBadge(label: String, active: Boolean = false) = TextView(this).apply {
+        text = label; textSize = 10f; setPadding(dp(7), dp(3), dp(7), dp(3))
+        setTextColor(if (active) C.PURPLE_LITE else C.TXT_MUTED)
+        setBackgroundColor(if (active) C.PURPLE_DARK else C.BG_CARD)
+    }
+    private fun iconBtn(label: String, action: () -> Unit) = TextView(this).apply {
+        text = label; textSize = 14f; gravity = Gravity.CENTER
+        setTextColor(C.TXT_MUTED); setBackgroundColor(C.BG_CARD)
+        setPadding(dp(10), dp(8), dp(10), dp(8)); minWidth = dp(40); minimumHeight = dp(36)
+        setOnClickListener { action() }
+    }
+    private fun pillBtn(label: String, primary: Boolean, action: () -> Unit) = TextView(this).apply {
+        text = label; textSize = 12f; gravity = Gravity.CENTER
+        setTypeface(null, Typeface.BOLD); setTextColor(C.PURPLE_LITE)
+        setBackgroundColor(if (primary) C.PURPLE else C.PURPLE_DARK)
+        setPadding(dp(18), dp(9), dp(18), dp(9)); setOnClickListener { action() }
     }
 
-    // ── Playback with animated playhead ──────────────────────────────────────
+    // ── Dialogs ───────────────────────────────────────────────────────────────
 
-    /**
-     * Plays all chords sequentially. For each chord:
-     *  1. Highlight the chord slot in the timeline
-     *  2. Animate the playhead across that chord's column in the piano roll
-     *  3. Animate the velocity bars for that chord
-     *  4. Play the audio
-     */
-    private fun playProgression() {
-        playJob?.cancel()
-        val chordDurationMs = (60_000L / bpm) * 4   // one bar per chord at current BPM
-
-        playJob = lifecycleScope.launch {
-            setBtnEnabled(generateBtn, false)
-            playBtn.text = "⏸"
-
-            val totalChords = progression.size
-            for ((i, pred) in progression.withIndex()) {
-
-                if (!isActive) break
-
-                // Highlight active chord slot
-                highlightTimelineSlot(i)
-
-                // Tell views which chord is active and start of sweep
-                pianoRollView.startPlayhead(i, totalChords, chordDurationMs)
-                velocityView.animateForChord(i, chordDurationMs)
-
-                // Play audio
-                PianoSynth.playChord(pred.midiNotes, durationMs = chordDurationMs.toInt())
-
-                delay(chordDurationMs)
+    private fun showPicker(which: String) {
+        val items: Array<String> = when (which) {
+            "Genre"  -> (listOf("None") + chordEngine.genreLabels).toTypedArray()
+            "Decade" -> (listOf("None") + ChordEngine.DECADE_LABELS).toTypedArray()
+            else -> return
+        }
+        AlertDialog.Builder(this).setTitle(which).setItems(items) { _, pos ->
+            val picked = items[pos]
+            when (which) {
+                "Genre"  -> { selectedGenre  = pos - 1; genreBtn.text  = "Genre\n$picked" }
+                "Decade" -> { selectedDecade = pos - 1; decadeBtn.text = "Decade\n$picked" }
             }
-
-            // Playback finished
-            withContext(Dispatchers.Main) {
-                isPlaying = false
-                playBtn.text = "▶"
-                setBtnEnabled(generateBtn, progression.size >= 2)
-                pianoRollView.stopPlayhead()
-                velocityView.stopAnimation()
-                rebuildTimeline()   // restore normal slot colours
-            }
-        }
+            updateMeta()
+        }.show()
     }
 
-    private fun highlightTimelineSlot(activeIdx: Int) {
-        for (i in 0 until timeline.childCount) {
-            timeline.getChildAt(i)?.alpha = if (i == activeIdx) 1f else 0.45f
-        }
+    private fun showBpmPicker() {
+        val options = arrayOf("60","80","90","100","110","120","130","140","160","180","200")
+        AlertDialog.Builder(this).setTitle("Tempo (BPM)").setItems(options) { _, pos ->
+            bpm = options[pos].toInt(); bpmLabel.text = "$bpm bpm"
+        }.show()
     }
 
-    // ── Actions ───────────────────────────────────────────────────────────────
-
-    private fun onPredictClicked() {
-        if (progression.size >= 4) return
-
-        if (progression.isEmpty()) {
-            val name = selectedChordName ?: run { chordHint.text = "Pick a starting note first"; return }
-            val tokenId = chordEngine.tokenForChord(name)
-                ?: chordsByRoot[selectedRoot]?.firstOrNull()?.let { chordEngine.tokenForChord(it) }
-                ?: run { chordHint.text = "'$name' not in model vocabulary"; return }
-            val notes = chordEngine.notesForChord(name)
-            tokenHistory.clear(); tokenHistory.add(ChordEngine.BOS_TOKEN)
-            tokenHistory.add(tokenId.toLong())
-            addToProgression(ChordEngine.Prediction(name, notes, tokenId, 0L))
-            PianoSynth.playChord(notes)
-            if (progression.size >= 4) return
-        }
-
-        setBtnEnabled(predictBtn, false); predictBtn.text = "Thinking…"
-
-        val genreW  = FloatArray(ChordEngine.N_GENRES).also  { w -> if (selectedGenre  in 0 until ChordEngine.N_GENRES)  w[selectedGenre]  = 1f }
-        val decadeW = FloatArray(ChordEngine.N_DECADES).also { w -> if (selectedDecade in 0 until ChordEngine.N_DECADES) w[selectedDecade] = 1f }
-
-        lifecycleScope.launch(Dispatchers.IO) {
-            val pred = runCatching {
-                chordEngine.predictNextChord(
-                    inputIds      = tokenHistory,
-                    genreWeights  = genreW,
-                    decadeWeights = decadeW,
-                    temperature   = temperatures[tempIndex].first
-                )
-            }.onFailure { Log.e("ChordAnds", "Prediction failed", it) }.getOrNull()
-
-            withContext(Dispatchers.Main) {
-                if (pred != null) {
-                    inferenceTimes.add(pred.inferenceMs)
-                    addToProgression(pred)
-                    PianoSynth.playChord(pred.midiNotes)
-                    pianoRollView.setChords(progression)
-                    rollTitleText.text = "piano roll · ${progression.size} chord${if (progression.size > 1) "s" else ""}"
-                }
-                predictBtn.text = "Predict next ↗"
-                setBtnEnabled(predictBtn, progression.size < 4)
-                setBtnEnabled(generateBtn, progression.size >= 2)
-            }
-        }
-    }
-
-    private fun onGenerateClicked() {
-        if (progression.isEmpty()) return
-        isPlaying = true
-        playProgression()
-    }
-
-    private fun togglePlay() {
-        if (progression.isEmpty()) return
-        isPlaying = !isPlaying
-        if (isPlaying) {
-            playProgression()
-        } else {
-            playJob?.cancel()
-            playBtn.text = "▶"
-            setBtnEnabled(generateBtn, progression.size >= 2)
-            pianoRollView.stopPlayhead()
-            velocityView.stopAnimation()
-            rebuildTimeline()
-        }
-    }
-
-    private fun onResetClicked() {
-        playJob?.cancel()
-        isPlaying = false; playBtn.text = "▶"
-        tokenHistory.clear(); tokenHistory.add(ChordEngine.BOS_TOKEN)
-        progression.clear(); inferenceTimes.clear()
-        rebuildTimeline()
-        pianoRollView.setChords(emptyList()); pianoRollView.stopPlayhead()
-        velocityView.stopAnimation()
-        rollTitleText.text = "piano roll"
-        chordHint.text     = "tap a key to set the first chord"
-        setBtnEnabled(predictBtn, true); setBtnEnabled(generateBtn, false)
-        updateMeta()
-    }
-
-    private fun addToProgression(pred: ChordEngine.Prediction) {
-        if (progression.size >= 4) return
-        progression.add(pred); rebuildTimeline()
-        val rem = 4 - progression.size
-        chordHint.text = "${pred.chordName} added · $rem slot${if (rem != 1) "s" else ""} remaining"
-        setBtnEnabled(predictBtn, progression.size < 4)
-        setBtnEnabled(generateBtn, progression.size >= 2)
+    private fun showSnapPicker() {
+        val options = arrayOf("1/4","1/8","1/16","1/32")
+        AlertDialog.Builder(this).setTitle("Snap Resolution").setItems(options) { _, pos ->
+            snapValue = options[pos]; snapBadge.text = snapValue
+        }.show()
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  PianoRollView — animated playhead
+//  PianoRollView — interactive: tap=add, long-press=delete, drag=move
 // ─────────────────────────────────────────────────────────────────────────────
-class PianoRollView(context: android.content.Context) : View(context) {
+class PianoRollView(
+    context: android.content.Context,
+    private val onNoteAdded   : (chordIdx: Int, midi: Int) -> Unit,
+    private val onNoteRemoved : (chordIdx: Int, midi: Int) -> Unit,
+    private val onNoteMoved   : (fromChord: Int, toChord: Int, midi: Int) -> Unit
+) : View(context) {
 
-    private var chords     : List<ChordEngine.Prediction> = emptyList()
-    private var playheadX  : Float = -1f   // -1 = hidden
+    private var chords     : List<EditableChord> = emptyList()
+    private var playheadX  = -1f
     private var animJob    : kotlinx.coroutines.Job? = null
 
+    // Touch tracking
+    private var touchDownChord = -1
+    private var touchDownMidi  = -1
+    private var isDragging     = false
+    private var longPressHandler = Handler(Looper.getMainLooper())
+    private var longPressRunnable: Runnable? = null
+    private val LONG_PRESS_MS = 600L
+    private val DRAG_THRESHOLD = 15f
+
+    private var touchDownX = 0f
+    private var touchDownY = 0f
+
+    // Display constants
+    private val KEY_W      = 52f
+    private val ROWS       = 14
     private val keyLabels  = listOf("C5","","B4","","A4","","G4","F4","","E4","","D4","","C4")
     private val keyIsBlack = listOf(false,true,false,true,false,true,false,false,true,false,true,false,true,false)
+
+    // MIDI 48=C4 (row 13) .. 60=C5 (row 0)
     private val midiToRow  = mapOf(
-        60 to 0, 59 to 2, 58 to 3, 57 to 4, 56 to 5, 55 to 6,
-        53 to 7, 52 to 9, 51 to 10, 50 to 11, 49 to 12, 48 to 13
+        60 to 0,  59 to 2,  58 to 3,  57 to 4,  56 to 5,  55 to 6,
+        53 to 7,  52 to 9,  51 to 10, 50 to 11, 49 to 12, 48 to 13
     )
+    private val rowToMidi  = midiToRow.entries.associate { (k,v) -> v to k }
 
     private val bgPaint   = Paint(Paint.ANTI_ALIAS_FLAG)
     private val notePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val hlPaint   = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL; color = Color.WHITE; alpha = 60 }
     private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
     private val txtPaint  = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.parseColor("#333352"); textSize = 20f; textAlign = Paint.Align.LEFT
     }
     private val phPaint   = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = C.ORANGE }
+    private val deletePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#FF3333"); style = Paint.Style.STROKE; strokeWidth = 3f
+    }
 
-    fun setChords(c: List<ChordEngine.Prediction>) { chords = c; invalidate() }
+    // Drag ghost note
+    private var dragGhostX = -1f
+    private var dragGhostY = -1f
+    private var dragGhostChord = -1
+    private var dragGhostRow = -1
 
-    /**
-     * Animate the playhead sweeping across chord slot [chordIdx] over [durationMs].
-     * Called once per chord during playback.
-     */
+    fun setEditableChords(c: List<EditableChord>) { chords = c; invalidate() }
+
     fun startPlayhead(chordIdx: Int, totalChords: Int, durationMs: Long) {
         animJob?.cancel()
-        val keyW   = 52f
-        val gridW  = width.toFloat() - keyW
-        val slotW  = gridW / maxOf(totalChords, 1)
-        val startX = keyW + chordIdx * slotW
-        val endX   = startX + slotW
-        val steps  = 60
-        val stepMs = durationMs / steps
-
+        val gridW = width.toFloat() - KEY_W
+        val slotW = gridW / maxOf(totalChords, 1)
+        val startX = KEY_W + chordIdx * slotW
+        val endX = startX + slotW
+        val steps = 60L; val stepMs = durationMs / steps
         animJob = kotlinx.coroutines.GlobalScope.launch(kotlinx.coroutines.Dispatchers.Main) {
             for (s in 0..steps) {
                 playheadX = startX + (endX - startX) * s / steps.toFloat()
-                invalidate()
-                kotlinx.coroutines.delay(stepMs)
+                invalidate(); kotlinx.coroutines.delay(stepMs)
             }
         }
     }
 
-    fun stopPlayhead() {
-        animJob?.cancel(); playheadX = -1f; invalidate()
+    fun stopPlayhead() { animJob?.cancel(); playheadX = -1f; invalidate() }
+
+    // ── Touch handling ────────────────────────────────────────────────────────
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        val rowH  = height.toFloat() / ROWS
+        val gridW = width.toFloat() - KEY_W
+        val slotW = if (chords.isEmpty()) gridW else gridW / chords.size.coerceAtLeast(1)
+
+        fun xToChord(x: Float) = ((x - KEY_W) / slotW).toInt().coerceIn(0, chords.size - 1)
+        fun yToRow(y: Float)   = (y / rowH).toInt().coerceIn(0, ROWS - 1)
+
+        when (event.action) {
+            MotionEvent.ACTION_DOWN -> {
+                touchDownX = event.x; touchDownY = event.y; isDragging = false
+                if (event.x < KEY_W || chords.isEmpty()) return true
+
+                val ci   = xToChord(event.x)
+                val row  = yToRow(event.y)
+                val midi = rowToMidi[row]
+
+                touchDownChord = ci; touchDownMidi = midi ?: -1
+
+                // Start long-press timer for deletion
+                if (midi != null && chords.getOrNull(ci)?.midiNotes?.contains(midi) == true) {
+                    longPressRunnable = Runnable {
+                        onNoteRemoved(ci, midi)
+                        touchDownChord = -1; touchDownMidi = -1; isDragging = false
+                        invalidate()
+                    }
+                    longPressHandler.postDelayed(longPressRunnable!!, LONG_PRESS_MS)
+                }
+                return true
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                val dx = Math.abs(event.x - touchDownX)
+                val dy = Math.abs(event.y - touchDownY)
+                if (!isDragging && (dx > DRAG_THRESHOLD || dy > DRAG_THRESHOLD)) {
+                    // User started dragging — cancel long press
+                    longPressRunnable?.let { longPressHandler.removeCallbacks(it) }
+                    if (touchDownChord >= 0 && touchDownMidi >= 0 &&
+                        chords.getOrNull(touchDownChord)?.midiNotes?.contains(touchDownMidi) == true) {
+                        isDragging = true
+                    }
+                }
+                if (isDragging) {
+                    dragGhostX     = event.x
+                    dragGhostY     = event.y
+                    dragGhostChord = if (event.x > KEY_W) xToChord(event.x) else touchDownChord
+                    dragGhostRow   = yToRow(event.y)
+                    invalidate()
+                }
+                return true
+            }
+
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                longPressRunnable?.let { longPressHandler.removeCallbacks(it) }
+
+                if (isDragging && touchDownChord >= 0 && touchDownMidi >= 0) {
+                    // Drop the note
+                    val toChord  = if (event.x > KEY_W) xToChord(event.x) else touchDownChord
+                    val toRow    = yToRow(event.y)
+                    val toMidi   = rowToMidi[toRow]
+                    if (toMidi != null) {
+                        if (toChord == touchDownChord && toMidi == touchDownMidi) {
+                            // Dropped on same note — no-op
+                        } else {
+                            onNoteMoved(touchDownChord, toChord, touchDownMidi)
+                            // If pitch changed within same chord, we need to also add new pitch
+                            if (toChord == touchDownChord && toMidi != touchDownMidi) {
+                                onNoteAdded(toChord, toMidi)
+                            }
+                        }
+                    }
+                    dragGhostX = -1f; dragGhostY = -1f; isDragging = false; invalidate()
+
+                } else if (!isDragging && event.x > KEY_W && chords.isNotEmpty()) {
+                    // Simple tap — add or ignore
+                    val ci   = xToChord(event.x)
+                    val row  = yToRow(event.y)
+                    val midi = rowToMidi[row]
+                    if (midi != null && chords.getOrNull(ci)?.midiNotes?.contains(midi) == false) {
+                        onNoteAdded(ci, midi)
+                    }
+                }
+
+                touchDownChord = -1; touchDownMidi = -1
+                return true
+            }
+        }
+        return false
     }
+
+    // ── Drawing ───────────────────────────────────────────────────────────────
 
     override fun onDraw(canvas: Canvas) {
         val w = width.toFloat(); val h = height.toFloat()
-        val keyW = 52f; val gridW = w - keyW
-        val rows = keyLabels.size; val rowH = h / rows
+        val gridW = w - KEY_W; val rowH = h / ROWS
 
         // Row backgrounds
         keyLabels.forEachIndexed { i, _ ->
             bgPaint.color = if (keyIsBlack[i]) Color.parseColor("#0D0D18") else Color.parseColor("#111120")
-            canvas.drawRect(0f, i * rowH, w, (i + 1) * rowH, bgPaint)
+            canvas.drawRect(0f, i * rowH, w, (i+1) * rowH, bgPaint)
+        }
+
+        // Column backgrounds (subtle tint per chord slot)
+        if (chords.isNotEmpty()) {
+            val slotW = gridW / chords.size
+            chords.forEachIndexed { ci, _ ->
+                val cols = C.SLOTS[ci % C.SLOTS.size]
+                bgPaint.color = cols[0]; bgPaint.alpha = 30
+                canvas.drawRect(KEY_W + ci*slotW, 0f, KEY_W + (ci+1)*slotW, h, bgPaint)
+                bgPaint.alpha = 255
+            }
         }
 
         // Key-grid separator
         linePaint.color = Color.parseColor("#363650"); linePaint.strokeWidth = 1.5f
-        canvas.drawLine(keyW, 0f, keyW, h, linePaint)
+        canvas.drawLine(KEY_W, 0f, KEY_W, h, linePaint)
 
-        // Beat lines
-        for (beat in 1..3) {
-            val x = keyW + gridW * beat / 4f
-            linePaint.strokeWidth = if (beat == 2) 1.5f else 0.5f
-            linePaint.color = if (beat == 2) Color.parseColor("#363650") else Color.parseColor("#2A2A3E")
-            canvas.drawLine(x, 0f, x, h, linePaint)
+        // Beat / chord column lines
+        if (chords.isNotEmpty()) {
+            val slotW = gridW / chords.size
+            for (i in 1 until chords.size) {
+                val x = KEY_W + i * slotW
+                linePaint.color = Color.parseColor("#363650"); linePaint.strokeWidth = 1.5f
+                canvas.drawLine(x, 0f, x, h, linePaint)
+            }
+            // Sub-beat lines inside each slot
+            for (ci in 0 until chords.size) {
+                for (b in 1..3) {
+                    val x = KEY_W + ci * slotW + slotW * b / 4f
+                    linePaint.color = Color.parseColor("#1E1E2E"); linePaint.strokeWidth = 0.5f
+                    canvas.drawLine(x, 0f, x, h, linePaint)
+                }
+            }
         }
 
-        // Row dividers (key side)
+        // Row dividers
         linePaint.color = Color.parseColor("#1A1A2A"); linePaint.strokeWidth = 0.5f
-        keyLabels.indices.forEach { i -> canvas.drawLine(0f, i * rowH, keyW, i * rowH, linePaint) }
+        keyLabels.indices.forEach { i -> canvas.drawLine(0f, i*rowH, KEY_W, i*rowH, linePaint) }
 
         // Key labels
         keyLabels.forEachIndexed { i, label ->
-            if (label.isNotEmpty()) canvas.drawText(label, 4f, i * rowH + rowH * 0.72f, txtPaint)
+            if (label.isNotEmpty()) canvas.drawText(label, 4f, i*rowH + rowH*0.72f, txtPaint)
         }
 
-        // Beat numbers
-        val beatTxt = Paint(txtPaint).apply { textSize = 18f; color = Color.parseColor("#2A2A3E") }
-        for (b in 0..3) canvas.drawText("${b+1}", keyW + gridW * b / 4f + 4f, 14f, beatTxt)
+        // Beat labels at top
+        if (chords.isNotEmpty()) {
+            val slotW = gridW / chords.size
+            val beatTxt = Paint(txtPaint).apply { textSize = 18f; color = Color.parseColor("#2A2A3E") }
+            chords.forEachIndexed { ci, chord ->
+                canvas.drawText(chord.name, KEY_W + ci*slotW + 4f, 14f, beatTxt)
+            }
+        }
 
-        // Notes
+        // ── Draw notes ────────────────────────────────────────────────────────
         if (chords.isEmpty()) {
-            notePaint.color = Color.parseColor("#222238"); notePaint.alpha = 160
+            // Ghost placeholder
+            notePaint.color = Color.parseColor("#222238"); notePaint.alpha = 100
             val pw = gridW / 4f * 0.82f
             listOf(9 to 0, 5 to 0, 13 to 1, 6 to 1, 7 to 2, 9 to 2, 4 to 3, 11 to 3).forEach { (row, slot) ->
-                val x = keyW + slot * (gridW / 4f) + 4f; val y = row * rowH + 1f
-                canvas.drawRoundRect(x, y, x + pw, y + rowH - 2f, 4f, 4f, notePaint)
+                val x = KEY_W + slot*(gridW/4f) + 4f; val y = row*rowH + 1f
+                canvas.drawRoundRect(x, y, x+pw, y+rowH-2f, 4f, 4f, notePaint)
             }
             notePaint.alpha = 255
         } else {
-            val slotW = gridW / 4f
-            chords.forEachIndexed { ci, pred ->
+            val slotW = gridW / chords.size
+            chords.forEachIndexed { ci, chord ->
                 val color = C.NOTE_COLORS[ci % C.NOTE_COLORS.size]
-                val nx = keyW + ci * slotW + 4f; val nw = slotW * 0.84f
-                val displayRows = pred.midiNotes.filter { it in 48..60 }
-                    .mapNotNull { midiToRow[it] }.take(4)
-                    .ifEmpty { listOf(listOf(9, 5, 7, 4)[ci % 4]) }
-                displayRows.forEachIndexed { ni, row ->
-                    notePaint.color = color; notePaint.alpha = if (ni == 0) 230 else 140
-                    val y = row * rowH + 1f
-                    canvas.drawRoundRect(nx, y, nx + nw, y + rowH - 2f, 4f, 4f, notePaint)
+                val nx = KEY_W + ci*slotW + 4f; val nw = slotW * 0.88f
+                val displayRows = chord.midiNotes.filter { it in 48..60 }
+                    .mapNotNull { midiToRow[it] }
+                    .ifEmpty { emptyList() }
+
+                displayRows.forEach { row ->
+                    // Skip the note being dragged
+                    val midi = rowToMidi[row]
+                    if (isDragging && ci == touchDownChord && midi == touchDownMidi) return@forEach
+
+                    notePaint.color = color; notePaint.alpha = 220
+                    val y = row*rowH + 1f
+                    canvas.drawRoundRect(nx, y, nx+nw, y+rowH-2f, 4f, 4f, notePaint)
+
+                    // Subtle highlight on top of note
+                    canvas.drawRoundRect(nx, y, nx+nw, y+rowH*0.3f, 4f, 4f, hlPaint)
                 }
             }
             notePaint.alpha = 255
         }
 
-        // Animated playhead
+        // ── Drag ghost note ───────────────────────────────────────────────────
+        if (isDragging && dragGhostX > 0f) {
+            val slotW = gridW / chords.size
+            val color = C.NOTE_COLORS[dragGhostChord.coerceIn(0, C.NOTE_COLORS.size-1)]
+            notePaint.color = color; notePaint.alpha = 160
+            val ghostY = dragGhostRow * rowH + 1f
+            val ghostNx = if (dragGhostChord >= 0) KEY_W + dragGhostChord*slotW + 4f else dragGhostX
+            val ghostNw = slotW * 0.88f
+            canvas.drawRoundRect(ghostNx, ghostY, ghostNx+ghostNw, ghostY+rowH-2f, 4f, 4f, notePaint)
+            notePaint.alpha = 255
+        }
+
+        // ── Playhead ──────────────────────────────────────────────────────────
         if (playheadX > 0f) {
             phPaint.style = Paint.Style.STROKE; phPaint.strokeWidth = 3f
             canvas.drawLine(playheadX, 0f, playheadX, h, phPaint)
             phPaint.style = Paint.Style.FILL
             canvas.drawPath(Path().apply {
-                moveTo(playheadX - 7f, 0f); lineTo(playheadX + 7f, 0f)
-                lineTo(playheadX, 13f); close()
+                moveTo(playheadX-7f, 0f); lineTo(playheadX+7f, 0f); lineTo(playheadX, 13f); close()
             }, phPaint)
         }
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  VelocityView — animated bars per chord
+//  VelocityView
 // ─────────────────────────────────────────────────────────────────────────────
 class VelocityView(context: android.content.Context) : View(context) {
-
-    // Static height fractions per chord (4 groups of 3 bars)
     private val chordFracs = arrayOf(
-        floatArrayOf(.80f, .65f, .90f),
-        floatArrayOf(.70f, .55f, .85f),
-        floatArrayOf(.95f, .72f, .60f),
-        floatArrayOf(.75f, .88f, .50f)
+        floatArrayOf(.80f,.65f,.90f), floatArrayOf(.70f,.55f,.85f),
+        floatArrayOf(.95f,.72f,.60f), floatArrayOf(.75f,.88f,.50f)
     )
     private val allFracs   = chordFracs.flatMap { it.toList() }
     private val baseColors = listOf(
-        C.PURPLE, C.PURPLE, C.PURPLE_DARK, C.PURPLE_DARK,
-        C.PURPLE, C.PURPLE_DARK, C.PURPLE, C.PURPLE,
-        C.PURPLE, C.PURPLE_DARK, C.PURPLE, C.PURPLE
+        C.PURPLE,C.PURPLE,C.PURPLE_DARK,C.PURPLE_DARK,
+        C.PURPLE,C.PURPLE_DARK,C.PURPLE,C.PURPLE,
+        C.PURPLE,C.PURPLE_DARK,C.PURPLE,C.PURPLE
     )
-
-    private var activeChord  = -1    // -1 = no active chord
-    private var animScale    = 1f    // 0..1 pulse during playback
-    private var animJob      : kotlinx.coroutines.Job? = null
-
+    private var activeChord = -1
+    private var animScale   = 1f
+    private var animJob     : kotlinx.coroutines.Job? = null
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
 
     fun animateForChord(chordIdx: Int, durationMs: Long) {
-        animJob?.cancel()
-        activeChord = chordIdx
+        animJob?.cancel(); activeChord = chordIdx
         animJob = kotlinx.coroutines.GlobalScope.launch(kotlinx.coroutines.Dispatchers.Main) {
-            val pulseMs = 120L
-            var up = true
-            val endTime = System.currentTimeMillis() + durationMs
+            var up = true; val endTime = System.currentTimeMillis() + durationMs
             while (System.currentTimeMillis() < endTime) {
-                animScale = if (up) 1f else 0.7f
-                up = !up
-                invalidate()
-                kotlinx.coroutines.delay(pulseMs)
+                animScale = if (up) 1f else 0.7f; up = !up; invalidate()
+                kotlinx.coroutines.delay(120L)
             }
         }
     }
 
-    fun stopAnimation() {
-        animJob?.cancel(); activeChord = -1; animScale = 1f; invalidate()
-    }
+    fun stopAnimation() { animJob?.cancel(); activeChord = -1; animScale = 1f; invalidate() }
 
     override fun onDraw(canvas: Canvas) {
         val w = width.toFloat(); val h = height.toFloat()
-        val count = allFracs.size
-        val gap = 2f; val barW = (w - gap * (count - 1)) / count
-
+        val gap = 2f; val barW = (w - gap*(allFracs.size-1)) / allFracs.size
         allFracs.forEachIndexed { i, frac ->
-            val chordGroup = i / 3
-            val isActive   = chordGroup == activeChord
-            val scale      = if (isActive) animScale else if (activeChord >= 0) 0.5f else 1f
-            val color      = if (isActive) C.NOTE_COLORS[chordGroup % C.NOTE_COLORS.size]
-            else baseColors[i % baseColors.size]
-            paint.color = color
+            val grp     = i / 3; val isActive = grp == activeChord
+            val scale   = if (isActive) animScale else if (activeChord >= 0) 0.5f else 1f
+            paint.color = if (isActive) C.NOTE_COLORS[grp % C.NOTE_COLORS.size] else baseColors[i % baseColors.size]
             paint.alpha = if (isActive) 255 else if (activeChord >= 0) 100 else 200
-
-            val x    = i * (barW + gap)
-            val barH = h * frac * scale
-            canvas.drawRoundRect(x, h - barH, x + barW, h, 2f, 2f, paint)
+            val x = i*(barW+gap); val barH = h*frac*scale
+            canvas.drawRoundRect(x, h-barH, x+barW, h, 2f, 2f, paint)
         }
         paint.alpha = 255
     }
@@ -818,9 +998,8 @@ class PianoSelectorView(
     context: android.content.Context,
     private val onRootSelected: (String) -> Unit
 ) : View(context) {
-
     private val whiteNotes = listOf("C","D","E","F","G","A","B")
-    private val blackNotes = listOf("C#" to 0, "D#" to 1, null to -1, "F#" to 3, "G#" to 4, "A#" to 5)
+    private val blackNotes = listOf("C#" to 0,"D#" to 1,null to -1,"F#" to 3,"G#" to 4,"A#" to 5)
     private var selectedRoot = "A#"
 
     private val whitePaint    = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#E8E8F0"); style = Paint.Style.FILL }
@@ -833,32 +1012,32 @@ class PianoSelectorView(
 
     override fun onDraw(canvas: Canvas) {
         val w = width.toFloat(); val h = height.toFloat()
-        val kW = w / 7f; val bW = kW * 0.62f; val bH = h * 0.60f
+        val kW = w/7f; val bW = kW*0.62f; val bH = h*0.60f
         whiteNotes.forEachIndexed { i, note ->
-            val x = i * kW; val sel = note == selectedRoot
+            val x = i*kW; val sel = note == selectedRoot
             canvas.drawRect(x+1f, 0f, x+kW-1f, h-1f, if (sel) selWhitePaint else whitePaint)
             canvas.drawRect(x+1f, 0f, x+kW-1f, h-1f, borderPaint)
             canvas.drawText(note, x+kW/2f, h-10f, if (sel) selLblPaint else labelPaint)
         }
         blackNotes.forEach { (note, idx) ->
             if (note == null) return@forEach
-            val x = idx * kW + kW - bW/2f; val sel = note == selectedRoot
+            val x = idx*kW + kW - bW/2f; val sel = note == selectedRoot
             canvas.drawRoundRect(x, 0f, x+bW, bH, 6f, 6f, if (sel) selBlackPaint else blackPaint)
         }
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         if (event.action != MotionEvent.ACTION_DOWN) return false
-        val kW = width.toFloat() / 7f; val bW = kW * 0.62f; val bH = height * 0.60f
+        val kW = width.toFloat()/7f; val bW = kW*0.62f; val bH = height*0.60f
         val x = event.x; val y = event.y
         if (y < bH) {
             blackNotes.forEach { (note, idx) ->
                 if (note == null) return@forEach
-                val bx = idx * kW + kW - bW/2f
+                val bx = idx*kW + kW - bW/2f
                 if (x in bx..(bx+bW)) { selectedRoot = note; onRootSelected(note); invalidate(); return true }
             }
         }
-        val idx = (x / kW).toInt().coerceIn(0, 6)
+        val idx = (x/kW).toInt().coerceIn(0, 6)
         selectedRoot = whiteNotes[idx]; onRootSelected(selectedRoot); invalidate()
         return true
     }
