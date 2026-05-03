@@ -247,8 +247,18 @@ class MainActivity : AppCompatActivity() {
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         col.addView(secLabel("② starting chord"))
         pianoSelector = PianoSelectorView(this) { root ->
-            selectedRoot = root; updateChordForRoot()
-            chordHint.text = "$root selected · tap Predict to start"; updateMeta()
+            selectedRoot = root; updateChordForRoot(); updateMeta()
+            val name  = selectedChordName ?: root
+            val notes = if (::chordEngine.isInitialized) chordEngine.notesForChord(name).toMutableList() else mutableListOf()
+            chordHint.text = "$name · tap Predict to build progression"
+            if (editableChords.isEmpty()) {
+                pianoRollView.setPreviewChord(EditableChord(name, notes))
+            } else {
+                editableChords[0] = EditableChord(name, notes)
+                pianoRollView.setEditableChords(editableChords)
+                rebuildTimeline()
+            }
+            if (notes.isNotEmpty()) PianoSynth.playChord(notes)
         }
         col.addView(pianoSelector, lp(MATCH, dp(72)) { setMargins(dp(14), 0, dp(14), dp(6)) })
         chordHint = TextView(this).apply {
@@ -711,7 +721,19 @@ class PianoRollView(
     private var dragGhostChord = -1
     private var dragGhostRow = -1
 
-    fun setEditableChords(c: List<EditableChord>) { chords = c; invalidate() }
+    // Preview chord shown before user taps Predict (single ghost slot)
+    private var previewChord: EditableChord? = null
+
+    fun setPreviewChord(chord: EditableChord) {
+        previewChord = chord
+        if (chords.isEmpty()) invalidate()
+    }
+
+    fun setEditableChords(c: List<EditableChord>) {
+        chords = c
+        if (c.isNotEmpty()) previewChord = null  // preview replaced by real chords
+        invalidate()
+    }
 
     fun startPlayhead(chordIdx: Int, totalChords: Int, durationMs: Long) {
         animJob?.cancel()
@@ -886,14 +908,29 @@ class PianoRollView(
         }
 
         // ── Draw notes ────────────────────────────────────────────────────────
-        if (chords.isEmpty()) {
-            // Ghost placeholder
+        if (chords.isEmpty() && previewChord == null) {
+            // Generic ghost placeholder — no key selected yet
             notePaint.color = Color.parseColor("#222238"); notePaint.alpha = 100
             val pw = gridW / 4f * 0.82f
             listOf(9 to 0, 5 to 0, 13 to 1, 6 to 1, 7 to 2, 9 to 2, 4 to 3, 11 to 3).forEach { (row, slot) ->
                 val x = KEY_W + slot*(gridW/4f) + 4f; val y = row*rowH + 1f
                 canvas.drawRoundRect(x, y, x+pw, y+rowH-2f, 4f, 4f, notePaint)
             }
+            notePaint.alpha = 255
+        } else if (chords.isEmpty() && previewChord != null) {
+            // Show the selected key's chord as a preview in slot 0
+            val preview = previewChord!!
+            val color = C.NOTE_COLORS[0]; val nw = gridW * 0.88f
+            val displayRows = preview.midiNotes.filter { it in 48..60 }.mapNotNull { midiToRow[it] }
+            displayRows.forEachIndexed { ni, row ->
+                notePaint.color = color; notePaint.alpha = if (ni == 0) 200 else 120
+                val y = row * rowH + 1f
+                canvas.drawRoundRect(KEY_W + 4f, y, KEY_W + nw, y + rowH - 2f, 4f, 4f, notePaint)
+                canvas.drawRoundRect(KEY_W + 4f, y, KEY_W + nw, y + rowH * 0.3f, 4f, 4f, hlPaint)
+            }
+            // Label
+            val lbl = Paint(txtPaint).apply { textSize = 18f; setColor(C.NOTE_COLORS[0]) }
+            canvas.drawText(preview.name, KEY_W + 6f, 14f, lbl)
             notePaint.alpha = 255
         } else {
             val slotW = gridW / chords.size
