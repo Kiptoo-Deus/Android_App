@@ -42,27 +42,22 @@ class KeyDetectorTest {
     }
 
     @Test fun `detects G major from G major scale notes`() {
-        // G major scale — F# is the distinguishing note.
-        // Repeat G and D strongly to anchor the tonic.
-        val notes = listOf("G4","G4","G4","B4","D5","D5","F#5","G5","G5")
+        val notes = listOf("G4","A4","B4","C5","D5","E5","F#5","G5")
         val result = KeyDetector.detect(notes)
         assertNotNull(result)
-        // KS algorithm should detect G major or its relative E minor —
-        // either is a valid musical interpretation of these notes.
-        assertTrue("Should detect G or E",
-            result!!.tonic == "G" || result.tonic == "E")
-        if (result.tonic == "G") assertEquals("major", result.mode)
+        assertEquals("G",     result!!.tonic)
+        assertEquals("major", result.mode)
     }
 
-    @Test fun `detects A minor from A minor melodic notes`() {
-        // A minor is relative to C major — a pure triad is ambiguous.
-        // Use the natural minor scale to give KS enough context.
-        val notes = listOf("A3","A4","A4","B4","C5","D5","E5","E5","A4","A4")
+    @Test fun `detects A minor from A minor natural scale`() {
+        // Natural minor scale gives KS enough pitch-class info
+        val notes = listOf("A4","B4","C5","D5","E5","F5","G5","A5")
         val result = KeyDetector.detect(notes)
         assertNotNull(result)
-        // Should detect A minor or its relative C major
-        assertTrue("Should detect A or C",
-            result!!.tonic == "A" || result.tonic == "C")
+        // A minor and C major are relative keys — both are valid detections
+        assertTrue("Should detect A minor or relative C major",
+            (result!!.tonic == "A" && result.mode == "minor") ||
+                    (result.tonic == "C" && result.mode == "major"))
     }
 
     // ── detect: edge cases ────────────────────────────────────────────────────

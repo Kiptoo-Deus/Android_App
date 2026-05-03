@@ -134,8 +134,9 @@ object KeyDetector {
      */
     private fun rotate(arr: DoubleArray, n: Int): DoubleArray {
         val size = arr.size
-        val shift = n % size
-        return DoubleArray(size) { arr[(it + shift) % size] }
+        // Rotate so that profile[0] (tonic position) aligns with semitone n.
+        // We subtract n (mod size) so the profile "slides" to match the tonic.
+        return DoubleArray(size) { arr[(it - n + size) % size] }
     }
 
     /**
