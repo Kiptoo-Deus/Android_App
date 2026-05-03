@@ -1,6 +1,7 @@
 package com.luciano.chordseq
 
 import android.app.AlertDialog
+import android.os.Build
 import android.graphics.*
 import android.os.Bundle
 import android.os.Handler
@@ -166,6 +167,12 @@ class MainActivity : AppCompatActivity() {
         window.decorView.setBackgroundColor(C.BG_WRAP)
         buildUI()
         chordEngine = ChordEngine(this)
+
+        // Start MIDI — background, no UI needed
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            ConnectMidi.start(this, ::onMidiEvent)
+        }
+
         lifecycleScope.launch {
             statusBadge.text = "Loading model…"
             val engineJob = async(Dispatchers.IO) { chordEngine.load() }
@@ -184,6 +191,9 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         playJob?.cancel()
         if (::chordEngine.isInitialized) chordEngine.close()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            ConnectMidi.stop()
+        }
     }
 
     // ── UI construction ───────────────────────────────────────────────────────
@@ -572,6 +582,57 @@ class MainActivity : AppCompatActivity() {
         chordHint.text = "${chord.name} added · $rem slot${if (rem != 1) "s" else ""} remaining"
         setBtnEnabled(predictBtn, editableChords.size < 4)
         setBtnEnabled(generateBtn, editableChords.size >= 2)
+    }
+
+    // ── MIDI event handler ───────────────────────────────────────────────────
+
+    private fun onMidiEvent(event: MidiEvent) {
+        when (event) {
+            is MidiEvent.DeviceConnected -> {
+                statusBadge.text = "${event.type} MIDI: ${event.name}"
+                Log.d("ChordAnds", "MIDI connected: ${event.name} (${event.type})")
+            }
+            is MidiEvent.DeviceDisconnected -> {
+                statusBadge.text = "MIDI disconnected"
+            }
+            is MidiEvent.NoteOn -> {
+                // Add note to the active chord slot on the piano roll
+                val targetSlot = editableChords.size.coerceAtMost(3)
+                if (editableChords.isNotEmpty()) {
+                    val lastIdx = editableChords.size - 1
+                    onNoteAdded(lastIdx, event.note)
+                } else {
+                    // No chords yet — use the note as a preview on the piano roll
+                    val preview = EditableChord(
+                        ChordAnalyser.analyse(listOf(event.note)),
+                        mutableListOf(event.note)
+                    )
+                    pianoRollView.setPreviewChord(preview)
+                    // Also set the piano selector to the root note
+                    selectedRoot = noteToRootName(event.note)
+                    updateChordForRoot()
+                    updateMeta()
+                }
+            }
+            is MidiEvent.NoteOff -> { /* no action needed */ }
+            is MidiEvent.ControlChange -> {
+                when (event.cc) {
+                    64 -> { // Sustain pedal → play / stop
+                        if (event.value >= 64) togglePlay()
+                    }
+                    7 -> { // Volume knob → BPM 60–180
+                        bpm = (60 + (event.value / 127f * 120f)).toInt()
+                        bpmLabel.text = "$bpm bpm"
+                    }
+                }
+            }
+        }
+    }
+
+    /** Maps a MIDI note number to its root note name (C, C#, D … B) */
+    private fun noteToRootName(midi: Int): String {
+        val names = listOf("C","C#","D","D#","E","F","F#","G","G#","A","A#","B")
+        return names[midi % 12]
     }
 
     // ── Engine ready ──────────────────────────────────────────────────────────

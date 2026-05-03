@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    USB Device Filter — ConnectMidi.kt
+    Tells Android which USB devices should be offered to ChordAnds.
+    class="0" subclass="0" protocol="0" matches all USB MIDI devices.
+-->
+<resources>
+    <usb-device class="1" subclass="3" protocol="0" />
+</resources>
