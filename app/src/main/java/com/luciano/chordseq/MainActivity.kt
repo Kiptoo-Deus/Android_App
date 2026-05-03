@@ -1,6 +1,8 @@
 package com.luciano.chordseq
 
 import android.app.AlertDialog
+import android.content.pm.PackageManager
+import androidx.core.app.ActivityCompat
 import android.os.Build
 import android.graphics.*
 import android.os.Bundle
@@ -157,6 +159,15 @@ class MainActivity : AppCompatActivity() {
     private lateinit var bpmLabel      : TextView
     private lateinit var snapBadge     : TextView
 
+    // Recording state
+    private lateinit var audioCapture   : AudioCapture
+    private var isRecording             = false
+    private lateinit var micBtn         : TextView
+    private lateinit var waveformBtn    : WaveformButtonView
+    private lateinit var confirmBtn     : TextView
+    private lateinit var cancelRecBtn   : TextView
+    private lateinit var liveNoteText   : TextView
+
     private val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
     private val WRAP  = ViewGroup.LayoutParams.WRAP_CONTENT
 
@@ -166,6 +177,18 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         window.decorView.setBackgroundColor(C.BG_WRAP)
         buildUI()
+        // Init audio capture
+        audioCapture = AudioCapture(
+            context = this,
+            onNoteDetected = { name, midi -> onLiveNoteDetected(name, midi) },
+            onPermissionDenied = { chordHint.text = "Microphone permission denied" }
+        )
+        // Request mic permission upfront
+        if (!audioCapture.hasPermission()) {
+            ActivityCompat.requestPermissions(this,
+                arrayOf(android.Manifest.permission.RECORD_AUDIO), 101)
+        }
+
         chordEngine = ChordEngine(this)
 
         // Start MIDI — background, no UI needed
@@ -330,23 +353,65 @@ class MainActivity : AppCompatActivity() {
 
     private fun buildBottomBar(): View {
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        // ── Row 1: Play | Mic | BPM | Generate ───────────────────────────────
         val row1 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(dp(14), dp(10), dp(14), dp(6)); gravity = Gravity.CENTER_VERTICAL
         }
-        playBtn  = iconBtn("▶") { togglePlay() }
+
+        playBtn = iconBtn("▶") { togglePlay() }
+
+        // Mic button — tap to start recording
+        micBtn = TextView(this).apply {
+            text = "🎤"; textSize = 16f; gravity = Gravity.CENTER
+            setTextColor(C.TXT_MUTED); setBackgroundColor(C.BG_CARD)
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            minWidth = dp(40); minimumHeight = dp(36)
+            setOnClickListener { startRecording() }
+        }
+
+        // Animated waveform — shown while recording (hidden initially)
+        waveformBtn = WaveformButtonView(this).apply {
+            visibility = View.GONE
+        }
+
+        // Live note text — shows detected note while recording
+        liveNoteText = TextView(this).apply {
+            text = ""; textSize = 11f; setTextColor(C.PURPLE_MID)
+            gravity = Gravity.CENTER; visibility = View.GONE
+        }
+
         bpmLabel = TextView(this).apply {
             text = "$bpm bpm"; textSize = 11f; setTextColor(C.TXT_MUTED)
             setOnClickListener { showBpmPicker() }
         }
+
         generateBtn = pillBtn("Generate ↗", primary = true) { onGenerateClicked() }
         generateBtn.isEnabled = false; generateBtn.alpha = 0.38f
+
+        // Confirm (✓) and Cancel (✕) — shown only during recording
+        confirmBtn = pillBtn("✓", primary = true) { confirmRecording() }.apply {
+            visibility = View.GONE; textSize = 16f
+        }
+        cancelRecBtn = iconBtn("✕") { cancelRecording() }.apply {
+            visibility = View.GONE
+        }
+
         row1.addView(playBtn)
-        row1.addView(View(this).apply { layoutParams = LinearLayout.LayoutParams(dp(10), 1) })
+        row1.addView(View(this).apply { layoutParams = LinearLayout.LayoutParams(dp(8), 1) })
+        row1.addView(micBtn)
+        row1.addView(waveformBtn, LinearLayout.LayoutParams(dp(36), dp(36)).apply { marginStart = dp(4) })
+        row1.addView(liveNoteText, lp(0, WRAP) { weight = 1f; marginStart = dp(8) })
         row1.addView(bpmLabel, lp(0, WRAP) { weight = 1f })
+        row1.addView(cancelRecBtn)
+        row1.addView(View(this).apply { layoutParams = LinearLayout.LayoutParams(dp(6), 1) })
+        row1.addView(confirmBtn)
+        row1.addView(View(this).apply { layoutParams = LinearLayout.LayoutParams(dp(6), 1) })
         row1.addView(generateBtn)
         col.addView(row1)
 
+        // ── Row 2: Predict | Reset ────────────────────────────────────────────
         val row2 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(dp(14), 0, dp(14), dp(14)); gravity = Gravity.CENTER_VERTICAL
@@ -633,6 +698,91 @@ class MainActivity : AppCompatActivity() {
     private fun noteToRootName(midi: Int): String {
         val names = listOf("C","C#","D","D#","E","F","F#","G","G#","A","A#","B")
         return names[midi % 12]
+    }
+
+    // ── Recording actions ────────────────────────────────────────────────────
+
+    private fun startRecording() {
+        if (!audioCapture.hasPermission()) {
+            ActivityCompat.requestPermissions(this,
+                arrayOf(android.Manifest.permission.RECORD_AUDIO), 101)
+            return
+        }
+        if (editableChords.size >= 4) {
+            chordHint.text = "All 4 chord slots are full — reset to record"
+            return
+        }
+        val started = audioCapture.start()
+        if (!started) return
+
+        isRecording = true
+
+        // Swap UI: hide mic + generate, show waveform + confirm/cancel
+        micBtn.visibility       = View.GONE
+        generateBtn.visibility  = View.GONE
+        bpmLabel.visibility     = View.GONE
+        waveformBtn.visibility  = View.VISIBLE
+        waveformBtn.startPulsing()
+        liveNoteText.visibility = View.VISIBLE
+        liveNoteText.text       = "Listening…"
+        confirmBtn.visibility   = View.VISIBLE
+        cancelRecBtn.visibility = View.VISIBLE
+
+        chordHint.text = "Recording… sing or play a note"
+    }
+
+    private fun confirmRecording() {
+        val notes = audioCapture.confirm()
+        isRecording = false
+        restoreRecordingUI()
+
+        if (notes.isEmpty()) {
+            chordHint.text = "No notes detected — try again"
+            return
+        }
+
+        val chordName = ChordAnalyser.analyse(notes)
+        val chord = EditableChord(chordName, notes.toMutableList())
+        addEditableChord(chord)
+        PianoSynth.playChord(notes)
+        chordHint.text = "Recorded: $chordName"
+    }
+
+    private fun cancelRecording() {
+        audioCapture.cancel()
+        isRecording = false
+        restoreRecordingUI()
+        chordHint.text = "Recording cancelled"
+    }
+
+    private fun restoreRecordingUI() {
+        waveformBtn.stopPulsing()
+        waveformBtn.visibility  = View.GONE
+        liveNoteText.visibility = View.GONE
+        liveNoteText.text       = ""
+        confirmBtn.visibility   = View.GONE
+        cancelRecBtn.visibility = View.GONE
+        micBtn.visibility       = View.VISIBLE
+        generateBtn.visibility  = View.VISIBLE
+        bpmLabel.visibility     = View.VISIBLE
+    }
+
+    /** Called on main thread each time YIN detects a note while recording */
+    private fun onLiveNoteDetected(name: String, midi: Int) {
+        liveNoteText.text = name
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 101) {
+            if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+                chordHint.text = "Microphone ready — tap 🎤 to record"
+            } else {
+                chordHint.text = "Microphone permission denied"
+            }
+        }
     }
 
     // ── Engine ready ──────────────────────────────────────────────────────────
@@ -1138,5 +1288,66 @@ class PianoSelectorView(
         val idx = (x/kW).toInt().coerceIn(0, 6)
         selectedRoot = whiteNotes[idx]; onRootSelected(selectedRoot); invalidate()
         return true
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WaveformButtonView — animated waveform icon shown while recording
+//  Draws 5 vertical bars that pulse up and down like a sound wave.
+// ─────────────────────────────────────────────────────────────────────────────
+class WaveformButtonView(context: android.content.Context) : View(context) {
+
+    private val barCount  = 5
+    private val barHeights = FloatArray(barCount) { 0.4f }
+    private val targets    = FloatArray(barCount) { 0.4f }
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE; style = Paint.Style.FILL
+    }
+    private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.BLACK; style = Paint.Style.FILL
+    }
+    private var animJob: kotlinx.coroutines.Job? = null
+
+    fun startPulsing() {
+        animJob?.cancel()
+        animJob = kotlinx.coroutines.GlobalScope.launch(kotlinx.coroutines.Dispatchers.Main) {
+            while (true) {
+                for (i in 0 until barCount) {
+                    targets[i] = (0.2f + Math.random().toFloat() * 0.75f)
+                }
+                // Animate toward targets
+                repeat(8) {
+                    for (i in 0 until barCount) {
+                        barHeights[i] += (targets[i] - barHeights[i]) * 0.4f
+                    }
+                    invalidate()
+                    kotlinx.coroutines.delay(40L)
+                }
+            }
+        }
+    }
+
+    fun stopPulsing() {
+        animJob?.cancel()
+        for (i in 0 until barCount) barHeights[i] = 0.4f
+        invalidate()
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        val w = width.toFloat(); val h = height.toFloat()
+        val r = minOf(w, h) / 2f
+
+        // Black circle background
+        canvas.drawCircle(w/2f, h/2f, r, bgPaint)
+
+        // Waveform bars
+        val barW  = w * 0.1f
+        val gap   = (w - barCount * barW) / (barCount + 1)
+        for (i in 0 until barCount) {
+            val bh   = h * 0.2f + barHeights[i] * h * 0.55f
+            val x    = gap + i * (barW + gap)
+            val top  = (h - bh) / 2f
+            canvas.drawRoundRect(x, top, x + barW, top + bh, barW/2f, barW/2f, paint)
+        }
     }
 }

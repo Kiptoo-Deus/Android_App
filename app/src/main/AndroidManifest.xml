@@ -2,6 +2,37 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
           package="com.luciano.chordseq">
 
+    <!-- ═══════════════════════════════════════════════════════════════════════
+         MIDI Permissions
+         Required by ConnectMidi.kt for USB and Bluetooth MIDI connections.
+    ════════════════════════════════════════════════════════════════════════ -->
+
+    <!-- Microphone — required by AudioCapture.kt (Layer 2) for pitch detection -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!-- USB MIDI — allows the app to communicate with USB MIDI devices -->
+    <uses-feature
+            android:name="android.hardware.midi"
+            android:required="false" />
+
+    <!-- Bluetooth MIDI — allows scanning and connecting to BLE MIDI devices -->
+    <uses-feature
+            android:name="android.hardware.bluetooth_le"
+            android:required="false" />
+
+    <!-- Bluetooth permissions (API < 31) -->
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+
+    <!-- Bluetooth permissions (API 31+) -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+                     android:usesPermissionFlags="neverForLocation" />
+
+    <!-- Required for BLE scanning on Android 6–11 -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
     <application
             android:allowBackup="true"
             android:icon="@android:drawable/sym_def_app_icon"
@@ -17,6 +48,14 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
+            <!-- Notify the activity when a USB MIDI device is attached -->
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data
+                    android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                    android:resource="@xml/device_filter" />
         </activity>
 
     </application>
