@@ -61,6 +61,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.media.midi.MidiDevice
 import android.media.midi.MidiDeviceInfo
 import android.media.midi.MidiInputPort
@@ -71,6 +72,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import androidx.annotation.RequiresApi
+import androidx.core.content.ContextCompat
 import android.os.Build
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -205,6 +207,21 @@ object ConnectMidi {
             Log.w(TAG, "Bluetooth not available"); return
         }
         if (!adapter.isEnabled) { Log.w(TAG, "Bluetooth disabled"); return }
+
+        // Check for required Bluetooth permissions before scanning
+        val bluetoothScanPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            android.Manifest.permission.BLUETOOTH_SCAN
+        } else {
+            android.Manifest.permission.ACCESS_FINE_LOCATION
+        }
+        
+        if (ContextCompat.checkSelfPermission(
+                appContext ?: return, bluetoothScanPermission
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            Log.w(TAG, "Bluetooth scan permission not granted, skipping BLE MIDI scanning")
+            return
+        }
 
         val scanner = adapter.bluetoothLeScanner ?: return
 
