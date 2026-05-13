@@ -3,6 +3,7 @@ package com.luciano.chordseq
 import android.app.AlertDialog
 import android.content.pm.PackageManager
 import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import android.os.Build
 import android.graphics.*
 import android.os.Bundle
@@ -181,7 +182,43 @@ class MainActivity : AppCompatActivity() {
     private val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
     private val WRAP  = ViewGroup.LayoutParams.WRAP_CONTENT
 
+    companion object {
+        private const val REQUEST_CODE_MIC_PERMISSION = 101
+        private const val REQUEST_CODE_BLUETOOTH_PERMISSIONS = 102
+    }
+
     // ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    private fun hasBluetoothPermissions(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            // Before Android 12 (API 31), no special Bluetooth permissions required
+            // Location permission is used as a proxy for BLE scanning
+            return ContextCompat.checkSelfPermission(
+                this, android.Manifest.permission.ACCESS_FINE_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED
+        }
+        // Android 12+ requires both BLUETOOTH_SCAN and BLUETOOTH_CONNECT
+        return ContextCompat.checkSelfPermission(
+            this, android.Manifest.permission.BLUETOOTH_SCAN
+        ) == PackageManager.PERMISSION_GRANTED &&
+               ContextCompat.checkSelfPermission(
+                   this, android.Manifest.permission.BLUETOOTH_CONNECT
+               ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun requestBluetoothPermissions() {
+        val permsToRequest = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            arrayOf(android.Manifest.permission.ACCESS_FINE_LOCATION)
+        } else {
+            arrayOf(
+                android.Manifest.permission.BLUETOOTH_SCAN,
+                android.Manifest.permission.BLUETOOTH_CONNECT
+            )
+        }
+        ActivityCompat.requestPermissions(
+            this, permsToRequest, REQUEST_CODE_BLUETOOTH_PERMISSIONS
+        )
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -196,7 +233,12 @@ class MainActivity : AppCompatActivity() {
         // Request mic permission upfront
         if (!audioCapture.hasPermission()) {
             ActivityCompat.requestPermissions(this,
-                arrayOf(android.Manifest.permission.RECORD_AUDIO), 101)
+                arrayOf(android.Manifest.permission.RECORD_AUDIO), REQUEST_CODE_MIC_PERMISSION)
+        }
+
+        // Request Bluetooth permissions before MIDI connection
+        if (!hasBluetoothPermissions()) {
+            requestBluetoothPermissions()
         }
 
         chordEngine = ChordEngine(this)
@@ -797,7 +839,7 @@ class MainActivity : AppCompatActivity() {
     private fun startRecording() {
         if (!audioCapture.hasPermission()) {
             ActivityCompat.requestPermissions(this,
-                arrayOf(android.Manifest.permission.RECORD_AUDIO), 101)
+                arrayOf(android.Manifest.permission.RECORD_AUDIO), REQUEST_CODE_MIC_PERMISSION)
             return
         }
         if (editableChords.size >= 4) {
@@ -878,11 +920,23 @@ class MainActivity : AppCompatActivity() {
         requestCode: Int, permissions: Array<out String>, grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 101) {
-            if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
-                chordHint.text = "Microphone ready — tap 🎤 to record"
-            } else {
-                chordHint.text = "Microphone permission denied"
+        when (requestCode) {
+            REQUEST_CODE_MIC_PERMISSION -> {
+                if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+                    chordHint.text = "Microphone ready — tap 🎤 to record"
+                } else {
+                    chordHint.text = "Microphone permission denied"
+                }
+            }
+            REQUEST_CODE_BLUETOOTH_PERMISSIONS -> {
+                if (grantResults.isNotEmpty() && 
+                    grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+                    Log.d("ChordAnds", "Bluetooth permissions granted")
+                    // Permissions were denied and then granted - BLE is already started but may have failed
+                    // In a production app, you might want to retry BLE scanning here
+                } else {
+                    Log.w("ChordAnds", "Bluetooth permissions denied - BLE MIDI won't work")
+                }
             }
         }
     }
